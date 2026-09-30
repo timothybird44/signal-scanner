@@ -472,7 +472,7 @@ class SignalScanner:
             
             # Validate simulated profit was calculated, else return the minimum lot for the symbol
             if not simProfit: 
-                return symbolInfo.volume_min, signalGroup['risk_amount'] # Assume the full risk amount to hedge
+                return symbolInfo.volume_min, -signalGroup['risk_amount'] # Assume the full risk amount to hedge
             
             # Calculate the lot risk and margin for a single lot
             rawLotRisk = signalGroup["risk_amount"] / abs(simProfit)
@@ -480,7 +480,7 @@ class SignalScanner:
             
             # Validate margin for a single lot was calculated, else return the minimum lot for the symbol
             if not marginForOneLot or marginForOneLot == 0:
-                return symbolInfo.volume_min, signalGroup['risk_amount'] # Assume the full risk amount to hedge
+                return symbolInfo.volume_min, -signalGroup['risk_amount'] # Assume the full risk amount to hedge
 
             # Calculate the final lot size based on the allowed risk and available capital
             availableCapital = accountInfo.margin_free * 0.9
@@ -490,11 +490,15 @@ class SignalScanner:
             finalLot = math.floor(rawLot / step) * step
             finalLot = round(float(max(symbolInfo.volume_min, min(finalLot, symbolInfo.volume_max))), 2)
             tradeRisk = self.MT5Client.order_calc_profit(orderType, symbol, finalLot, entryPrice, stopLossPrice)
-            
+
+            # Assume the full risk amount if the trade risk could not be calculated
+            if tradeRisk is None:
+                tradeRisk = -signalGroup['risk_amount']
+
             return finalLot, tradeRisk
-        
+
         except Exception as e:
-            self.send_notification(f"<b>Error get_open_price:</b> {e}")
+            self.send_notification(f"<b>Error calculate_lot_size:</b> {e}")
             return None, None
     
     """
@@ -595,18 +599,24 @@ class SignalScanner:
             # Modify TPs as required by SG params
             signalData = self.modify_tps(signalGroup, signalData)
 
+            # Verify the TPs were modified successfully
+            if signalData is None:
+                self.send_notification(f"<b>Error place_trade:</b> Unable to prepare the signal's take profits")
+                return None
+
             # Get the signal's trade side, symbol, and symbol info
             side = signalData['side']
             symbol = signalData['symbol']
             self.MT5Client.symbol_select(symbol, True)
             symbolInfo = self.MT5Client.symbol_info(symbol)
-            digits = symbolInfo.digits
 
             # Verify the symbol info was returned
             if symbolInfo is None:
                 self.send_notification(f"<b>Error place_trade:</b> Symbol info could not be found for {symbol}")
                 return None
-            
+
+            digits = symbolInfo.digits
+
             # Get the symbol's tick
             tick = None
             for _ in range(5):
@@ -685,12 +695,19 @@ class SignalScanner:
                 return None
 
             # Determine if the the risk can be afforded
-            _, dailyProfit = self.check_daily_profit(symbol)
-            currentRisk = self.MT5liveRisk + dailyProfit + tradeRisk
+            # Skipped when the max daily loss is disabled (0)
+            if self.MT5maxDailyLoss != 0:
+                allowTrade, dailyProfit = self.check_daily_profit(symbol)
 
-            if currentRisk < self.MT5maxDailyLoss:
-                self.send_notification("<b>Info place_trade:</b> trade cannot be placed as it would exceed the allowed daily loss")
-                return None
+                if not allowTrade:
+                    self.send_notification("<b>Info place_trade:</b> trade cannot be placed as the daily profit could not be confirmed or the max daily loss is exceeded")
+                    return None
+
+                currentRisk = self.MT5liveRisk + dailyProfit + tradeRisk
+
+                if currentRisk < self.MT5maxDailyLoss:
+                    self.send_notification("<b>Info place_trade:</b> trade cannot be placed as it would exceed the allowed daily loss")
+                    return None
             
             # Define the weight distribution of lots for each TP based on how many were defined
             weightMap = {
@@ -699,7 +716,7 @@ class SignalScanner:
                 3: [0.5, 0.3, 0.2],
                 4: [0.4, 0.3, 0.2, 0.1],
                 5: [0.3, 0.25, 0.2, 0.15, 0.1],
-                6: [0.25, 0.3, 0.25, 0.2, 0.15, 0.05, 0.05]
+                6: [0.25, 0.2, 0.2, 0.15, 0.1, 0.1]
             }
             weights = weightMap[len(activeTps)]
 
@@ -838,6 +855,12 @@ class SignalScanner:
                 while True:
                     # Get all open positions for this bot
                     positions = self.MT5Client.positions_get(symbol=symbol)
+
+                    # positions_get returns None on a failed request (not the same as no open positions) - retry
+                    if positions is None:
+                        TimeModule.sleep(5)
+                        continue
+
                     filteredPositions = [p for p in positions if p.magic == tradeMagicNumber]
 
                     # Create a set of current tickets to identify closures
@@ -862,6 +885,7 @@ class SignalScanner:
                     # Get current tick to see where the market is
                     tick = self.MT5Client.symbol_info_tick(symbol)
                     if not tick:
+                        TimeModule.sleep(5)
                         continue
 
                     # Get the current price of the symbol
@@ -1000,20 +1024,20 @@ class SignalScanner:
         try:
             # if set to 0, bypass max daily loss check and allow all trades
             if self.MT5maxDailyLoss == 0:
-                return True
+                return True, 0.0
             
             allowTrades = False
 
             # Ensure the symbol is selected
             if not self.MT5Client.symbol_select(symbol, True):
                 self.send_notification(f"<b>Error check_daily_profit:</b> {symbol} not found in broker list.")
-                return False
+                return False, 0.0
 
             # Get all trades from the start of today until now
             tick = self.MT5Client.symbol_info_tick(symbol)
             if tick is None:
                 self.send_notification(f"<b>Error check_daily_profit:</b> Could not determine the tick for {symbol}")
-                return False
+                return False, 0.0
             
             brokerTime = tick.time
             todayStart = brokerTime - (brokerTime % 86400)
@@ -1022,7 +1046,7 @@ class SignalScanner:
 
             if historyDeals is None:
                 self.send_notification(f"<b>Error check_daily_profit:</b> Failed to fetch history, error code: {self.MT5Client.last_error()}")
-                return 0.0
+                return False, 0.0
             
             totalProfit = 0.0
 
@@ -1042,7 +1066,7 @@ class SignalScanner:
         
         except Exception as e:
             self.send_notification(f"<b>Error check_daily_profit:</b> {e}")
-            return None, None
+            return False, 0.0
         
     """
     method  get_balance
@@ -1063,6 +1087,7 @@ class SignalScanner:
             
             else:
                 self.send_notification(f"<b>Error get_balance:</b> unable to get account information &gt {self.MT5Client.last_error()}")
+                return None, None
 
         except Exception as e:
             self.send_notification(f"<b>Error get_balance:</b> {e}")
