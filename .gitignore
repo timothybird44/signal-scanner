@@ -1,0 +1,13 @@
+# Local credentials
+config.py
+.env
+
+# Telegram session files (contain auth tokens)
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
